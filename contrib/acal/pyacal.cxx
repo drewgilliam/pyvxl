@@ -26,6 +26,249 @@ template <typename... Args>
 using overload_cast_ = py::detail::overload_cast_impl<Args...>;
 
 
+// ------------------------------
+// acal_match_tree pickling
+// ------------------------------
+
+using TREE_TUPLE = std::tuple<size_t, size_t, size_t>;
+using NODE_TUPLE = std::tuple<size_t, bool, size_t, std::vector<size_t>,
+                              std::vector<std::vector<acal_match_pair> > >;
+
+py::tuple
+tree_getstate(std::shared_ptr<acal_match_tree> const& tree)
+{
+  // basic tree info
+  auto tree_info = std::make_tuple(
+      tree->root_->cam_id_,
+      tree->n_,
+      tree->min_n_tracks_
+  );
+
+  // collect node info
+  std::vector<NODE_TUPLE> node_info;
+  for (auto const& node : tree->nodes()) {
+    node_info.push_back(std::make_tuple(
+        node->cam_id_,
+        node->has_parent(),
+        node->parent_id(),
+        node->children_ids(),
+        node->self_to_child_matches_
+    ));
+  }
+
+  // save
+  return py::make_tuple(tree_info, node_info);
+}
+
+std::shared_ptr<acal_match_tree>
+tree_setstate(py::tuple t)
+{
+  // retreive info from tuple
+  if (t.size() != 2)
+    throw std::runtime_error("Can't unpickle acal_match_tree- Invalid state!");
+
+  // cast tuple info
+  auto tree_info = t[0].cast<TREE_TUPLE>();
+  auto node_info = t[1].cast<std::vector<NODE_TUPLE> >();
+
+  // create nodes (temporarily unlinked)
+  std::map<size_t, std::shared_ptr<acal_match_node> > nodes;
+  for (auto item : node_info) {
+    auto node_id = std::get<0>(item);
+    nodes[node_id] = std::make_shared<acal_match_node>(node_id);
+  }
+
+  // link nodes
+  for (auto item : node_info) {
+    auto node_id = std::get<0>(item);
+    auto node = nodes[node_id];
+
+    auto has_parent = std::get<1>(item);
+    if (has_parent) {
+      auto parent_id = std::get<2>(item);
+      node->parent(nodes[parent_id]);
+    }
+
+    auto children_ids = std::get<3>(item);
+    for (auto child_id : children_ids) {
+      node->children_.push_back(nodes[child_id]);
+    }
+
+    node->self_to_child_matches_ = std::get<4>(item);
+  }
+
+  // create tree
+  auto tree = std::make_shared<acal_match_tree>();
+  tree->root_ = nodes[std::get<0>(tree_info)];
+  tree->n_ = std::get<1>(tree_info);
+  tree->min_n_tracks_ = std::get<2>(tree_info);
+
+  // cleanup
+  return tree;
+}
+
+
+// ------------------------------
+// acal_match_graph pickling
+// ------------------------------
+
+using VERTEX_TUPLE = std::tuple<size_t, bool>;
+using EDGE_TUPLE = std::tuple<size_t, size_t, size_t, std::vector<acal_match_pair> >;
+
+py::tuple
+graph_getstate(acal_match_graph& graph)
+{
+  // vertices
+  // std::map<size_t, std::shared_ptr<match_vertex> > match_vertices_;
+  std::map<size_t, VERTEX_TUPLE> vertex_info;
+  auto vertices = graph.vertices();
+  for (auto const& item : vertices) {
+    auto vertex = item.second;
+    vertex_info[item.first] = std::make_tuple(
+        vertex->cam_id_,
+        vertex->mark_
+    );
+  }
+
+  // edges
+  // std::vector<std::shared_ptr<match_edge> > match_edges_;
+  std::vector<EDGE_TUPLE> edge_info;
+  auto edges = graph.edges();
+  for (auto const& edge : edges) {
+    edge_info.push_back(std::make_tuple(
+        edge->id_,
+        edge->v0_->cam_id_,
+        edge->v1_->cam_id_,
+        edge->matches_
+    ));
+  }
+
+  // connected components
+  // std::vector<std::vector<std::shared_ptr<match_vertex> > > components;
+  std::vector<std::vector<size_t> > component_info;
+  auto components = graph.get_connected_components();
+  for (auto const& component : components) {
+    std::vector<size_t> vertex_ids;
+    for (auto const& vertex : component) {
+      vertex_ids.push_back(vertex->cam_id_);
+    }
+    component_info.push_back(vertex_ids);
+  }
+
+  // trees
+  // std::map<size_t, std::map<size_t, std::shared_ptr<acal_match_tree> > >
+  std::map<size_t, std::map<size_t, py::tuple> > tree_node_info;
+  auto trees = graph.get_match_trees();
+  for (auto const& row : trees) {
+    auto i = row.first;
+    for (auto const& item : row.second) {
+      auto j = item.first;
+      auto tree = item.second;
+      tree_node_info[i][j] = tree_getstate(tree);
+    }
+  }
+
+  // Return a tuple that fully encodes the state of the object
+  return py::make_tuple(graph.get_params(),
+                        graph.get_image_paths(),
+                        graph.all_acams(),
+                        vertex_info,
+                        edge_info,
+                        component_info,
+                        graph.get_focus_tracks(),
+                        graph.get_focus_track_metrics(),
+                        tree_node_info,
+                        graph.get_match_tree_metrics());
+}
+
+acal_match_graph
+graph_setstate(py::tuple t)
+{
+  if (t.size() != 10)
+    throw std::runtime_error("Can't unpickle acal_match_graph - Invalid state!");
+
+  // vertices
+  std::map<size_t, std::shared_ptr<match_vertex> > vertices;
+  auto vertex_info = t[3].cast<std::map<size_t, VERTEX_TUPLE> >();
+
+  for (auto const& item : vertex_info) {
+    auto i = item.first;
+    auto data = item.second;
+
+    auto cam_id = std::get<0>(data);
+    auto mark = std::get<1>(data);
+
+    auto vertex = std::make_shared<match_vertex>(cam_id);
+    vertex->mark_ = mark;
+
+    vertices[i] = vertex;
+  }
+
+  // edges
+  std::vector<std::shared_ptr<match_edge> > edges;
+  auto edge_info = t[4].cast<std::vector<EDGE_TUPLE> >();
+
+  for (auto const& data : edge_info) {
+    auto id = std::get<0>(data);
+    auto v0_id = std::get<1>(data);
+    auto v1_id = std::get<2>(data);
+    auto matches = std::get<3>(data);
+
+    auto v0 = vertices[v0_id];
+    auto v1 = vertices[v1_id];
+
+    auto edge = std::make_shared<match_edge>(v0, v1, matches, id);
+
+    edges.push_back(edge);
+  }
+
+  // connected components
+  std::vector<std::vector<std::shared_ptr<match_vertex> > > components;
+  auto component_info = t[5].cast<std::vector<std::vector<size_t> > >();
+
+  for (auto const& vertex_ids : component_info) {
+    std::vector<std::shared_ptr<match_vertex> > component_vertices;
+    for (auto const& vertex_id : vertex_ids) {
+      component_vertices.push_back(vertices[vertex_id]);
+    }
+    components.push_back(component_vertices);
+  }
+
+  // trees
+  std::map<size_t, std::map<size_t, std::shared_ptr<acal_match_tree> > > trees;
+  auto tree_info = t[8].cast<std::map<size_t, std::map<size_t, py::tuple > > >();
+
+  for (auto const& row : tree_info) {
+    auto i = row.first;
+    for (auto const& item : row.second) {
+      auto j = item.first;
+      auto tree_tuple = item.second;
+      trees[i][j] = tree_setstate(tree_tuple);
+    }
+  }
+
+  // create & populate instance
+  acal_match_graph graph;
+  graph.set_params(t[0].cast<match_params>());
+  graph.set_image_paths(t[1].cast<std::map<size_t, std::string> >());
+  graph.set_all_acams(t[2].cast<std::map<size_t, vpgl_affine_camera<double> > >());
+  graph.set_vertices(vertices);
+  graph.set_edges(edges);
+  graph.set_connected_components(components);
+  graph.set_focus_tracks(t[6].cast<std::map<size_t, std::map<size_t,
+                                   std::vector< std::map<size_t, vgl_point_2d<double> > > > > >());
+  graph.set_focus_track_metrics(t[7].cast<std::vector<double> >());
+  graph.set_match_trees(trees);
+  graph.set_match_tree_metrics(t[9].cast<std::vector<size_t> >());
+
+  return graph;
+}
+
+
+// ------------------------------
+// main wrapping function
+// ------------------------------
+
 void wrap_acal(py::module &m)
 {
 
@@ -132,6 +375,7 @@ void wrap_acal(py::module &m)
          "save a match tree to a dot file",
          py::arg("path"))
     .def(py::self == py::self)
+    .def(py::pickle(&tree_getstate, &tree_setstate))
     ;
 
   // acal_match_graph::match_vertex
@@ -195,6 +439,7 @@ void wrap_acal(py::module &m)
     .def("save_graph_dot_format", &acal_match_graph::save_graph_dot_format,
          "save a match graph to a dot file", py::arg("path"))
     .def(py::self == py::self)
+    .def(py::pickle(&graph_getstate, &graph_setstate))
     ;
 
 } // wrap_acal
